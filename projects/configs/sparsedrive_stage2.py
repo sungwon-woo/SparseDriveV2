@@ -640,6 +640,16 @@ model = dict(
                 type="LatLonPredModuleV13",
                 embed_dims=embed_dims,
                 plan_config=plan_config,
+                ffn_cfg=dict(
+                    type="AsymmetricFFN",
+                    in_channels=embed_dims,
+                    pre_norm=dict(type="LN"),
+                    embed_dims=embed_dims,
+                    feedforward_channels=embed_dims * 2,
+                    num_fcs=2,
+                    ffn_drop=0.1,
+                    add_identity=True,
+                ),
             ),
             traj_pred_layer=dict(
                 type="TrajPredModule",

@@ -15,7 +15,7 @@ from mmcv.cnn.bricks.registry import (
 )
 
 from projects.mmdet3d_plugin.core.box3d import *
-from ..blocks import linear_relu_ln
+from ..blocks import linear_relu_ln, AsymmetricFFN  # noqa: F401
 
 
 @PLUGIN_LAYERS.register_module()
@@ -982,11 +982,18 @@ class LatLonPredModuleV13(BaseModule):
         embed_dims=256,
         plan_config=None,
         filter_mode="score",
+        ffn_cfg=None,
     ):
         super(LatLonPredModuleV13, self).__init__()
         self.embed_dims = embed_dims
         self.plan_config = plan_config
         self.filter_mode = filter_mode
+        if ffn_cfg is not None:
+            self.lat_ffn = build_from_cfg(ffn_cfg, FEEDFORWARD_NETWORK)
+            self.lon_ffn = build_from_cfg(ffn_cfg, FEEDFORWARD_NETWORK)
+        else:
+            self.lat_ffn = None
+            self.lon_ffn = None
         self.lat_cls_branch = nn.Sequential(
             *linear_relu_ln(embed_dims, 2, 2),
             Linear(embed_dims, 1),
@@ -1013,6 +1020,11 @@ class LatLonPredModuleV13(BaseModule):
     ):
         num_path = path_embed.shape[1]
         num_vel = vel_embed.shape[1]
+
+        if self.lat_ffn is not None:
+            path_embed = self.lat_ffn(path_embed)
+        if self.lon_ffn is not None:
+            vel_embed = self.lon_ffn(vel_embed)
 
         path_scores = self.lat_cls_branch(path_embed).squeeze(-1)
         vel_scores = self.lon_cls_branch(vel_embed).squeeze(-1)
