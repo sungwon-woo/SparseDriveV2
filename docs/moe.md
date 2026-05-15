@@ -1,7 +1,8 @@
-# Path MoE for `LatLonPredModuleV13` — Implementation Notes
+# Lat + Lon MoE for `LatLonPredModuleV13` — Implementation Notes
 
-Branch: `dev/moe`
-Scope: **lat (path) expert MoE only**. Lon (vel) MoE is not implemented yet.
+Branch: `dev/lat_lon_moe` (extends `dev/lat_moe`)
+Scope: **lat (path) + lon (vel) expert MoE**. Both `lat_ffn` and `lon_ffn` of
+`LatLonPredModuleV13` are replaced by Dense Soft MoE blocks.
 
 ## Overview
 
@@ -186,18 +187,89 @@ baseline:
    (`ExpertBankFFN` with K=1 is bit-identical to a plain FFN — verified in
    unit tests)
 
+## Lon (vel) MoE — Steps 9–14
+
+### Step 9 — Dataset `vel_class` label
+- 6-way vel class constants (`VEL_CRUISE..VEL_GIVEWAY`) + scenario set
+  groupings (`VEL_TRAFFIC_SCENARIOS`, `VEL_OVERTAKING_SCENARIOS`,
+  `VEL_MERGING_SCENARIOS`, `VEL_GIVEWAY_SCENARIOS`)
+- `get_vel_class(info)` maps scenario label → 0..5 (CRUISE fallback if scenario
+  missing). Reuses the existing `_get_scenario_label` cache.
+- `get_ann_info` attaches `anns_results['vel_class']` (np.int64 scalar) next to
+  `path_class`
+- **Files**: `projects/mmdet3d_plugin/datasets/b2d_3d_dataset.py`
+
+### Step 10 — Collect key
+- Train pipeline `Collect.keys` gains `'vel_class'` (test/eval unchanged —
+  DR loss is train-only)
+- **Files**: `projects/configs/sparsedrive_stage2.py`
+
+### Step 11 — Extend `LatLonPredModuleV13MoE`
+- Added `num_vel_experts=6` ctor arg. Sets `self.lon_ffn = None` and builds
+  `vel_router` (`ETFRouter`, K=6) + `lon_moe` (`ExpertBankFFN`, K=6) with the
+  same `routing_dim`/`ffn_hidden_dim` as lat
+- Refactored routing into shared helper `_route_moe(x, router, moe, aux)`;
+  `_route_lat` / `_route_lon` are thin wrappers that stash to `last_path_*` /
+  `last_vel_*`
+- `forward`: `vel_embed = self._route_lon(vel_embed, aux=aux)` (replaces
+  `lon_ffn` call). aux is shared with lat (current self-conditioning is
+  per-branch via the helper)
+- Same `self.tau` drives both routers — TauAnnealingHook anneals lat and vel
+  together (memory option (a))
+- **Files**: `projects/mmdet3d_plugin/models/motion/motion_blocks.py`
+
+### Step 12 — DR loss wiring for vel
+- In `MotionPlanningHeadV13.forward` after `lat_lon_pred`: if module has
+  `last_vel_q`, stash `vel_router_q` / `vel_router_logits` /
+  `_vel_router_module` into `plan_result`
+- In `loss_planning`: if `vel_router_q` present, call
+  `module.vel_router.dr_loss(q, data['vel_class'])` →
+  `vel_router_dr_loss_{decoder_idx}`, weighted by
+  `plan_config['vel_router']['weight']`
+- **Files**: `projects/mmdet3d_plugin/models/motion/motion_planning_head_v13.py`
+
+### Step 13 — Config
+- `plan_config['vel_router'] = dict(weight=1.0)`
+- `lat_lon_pred_layer.num_vel_experts = 6`
+- TauAnnealingHook unchanged (already class-name pattern matches both routers)
+- **Files**: `projects/configs/sparsedrive_stage2.py`
+
+### Step 14 — Smoke test
+- `scripts/smoke_test_lon_moe.py`: forward + DR loss + grad flow + tau set
+  check. Run inside the `sparsedrive` conda env.
+
+## Velocity class definition (lon MoE, K=6)
+
+| Class | Scenario condition | Train distribution |
+|---|---|---|
+| CRUISE (0) | scenario = NORMAL (or missing) | 54.53 % |
+| TRAFFIC (1) | scenario ∈ {TRAFFIC_LIGHT, TRAFFIC_SIGN} | 19.13 % |
+| OVERTAKING (2) | scenario ∈ {OVERTAKING, PARKING_EXIT} | 13.07 % |
+| MERGING (3) | scenario ∈ {MERGING_HIGHWAY, MERGING_JUNCTION} | 5.68 % |
+| EMERGENCY_BRAKE (4) | scenario = EMERGENCY_BRAKE | 5.19 % |
+| GIVEWAY (5) | scenario ∈ {GIVEWAY, GIVEWAY_HIGHWAY} | 2.38 % |
+
+Max imbalance ≈ 23:1 (CRUISE vs GIVEWAY) — harsher than lat (13:1). Class
+imbalance handling via ETF prototypes + DR loss is the primary defense; class
+balanced sampler is deferred (see below).
+
+Loss terms added: `vel_router_dr_loss_0`, `vel_router_dr_loss_1`.
+
 ## Pending work (not in this branch)
 
-1. **Lon (vel) MoE** — same pattern with 6-way `vel_class` from scenario labels
-   (CRUISE / OVERTAKING / MERGING / EMERGENCY_BRAKE / GIVEWAY / TRAFFIC). Will
-   require adding `vel_class` to dataset + new `vel_moe` + DR loss term.
-2. **Better router aux** — currently self-conditioning (`aux = mean(path_embed)`).
+1. **Better router aux** — currently self-conditioning (`aux = mean(path_embed)`
+   for lat, `mean(vel_embed)` for lon).
    The original design used `agent_pool_emb` (geometric-weighted pool of
    `instance_feature_selected`) + `command_far` embedding. Wiring this requires
    plumbing `aux` through the head to the MoE module.
-3. **Class-balanced sampler** — `GroupInBatchSampler` (current) handles temporal
+2. **Class-balanced sampler** — `GroupInBatchSampler` (current) handles temporal
    streaming, not class balance. A weighted sequence sampler that preserves
-   in-sequence frame order would be needed if minority classes starve. Defer
-   until after the first training trial.
-4. **Hard inference toggle** — currently soft routing at inference too. After
-   training, switching to top-1 hard routing usually closes a small gap.
+   in-sequence frame order would be needed if minority classes starve. Vel's
+   23:1 imbalance is harsher than lat's, so this is more urgent on the vel
+   side. Defer until after the first training trial.
+3. **Hard inference toggle** — currently soft routing at inference for both
+   lat and vel. Lat: top-1 hard may close a small gap. Vel: keep soft (classes
+   overlap semantically — cruise↔traffic, merging↔overtaking).
+4. **Per-branch tau** — currently a single `self.tau` drives both routers via
+   `TauAnnealingHook`. If vel routing sharpens too fast (or too slow) relative
+   to lat, generalize the hook to set `tau_lat` / `tau_vel` independently.

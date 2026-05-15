@@ -1100,6 +1100,7 @@ class LatLonPredModuleV13MoE(LatLonPredModuleV13):
         filter_mode="score",
         ffn_cfg=None,
         num_path_experts=5,
+        num_vel_experts=6,
         router_aux_dim=None,
         router_routing_dim=64,
         router_hidden_dim=None,
@@ -1108,19 +1109,21 @@ class LatLonPredModuleV13MoE(LatLonPredModuleV13):
         tau=1.0,
     ):
         # Initialize V13 base (this builds lat_cls_branch / lon_cls_branch and
-        # optionally lat_ffn / lon_ffn from ffn_cfg). We then drop lat_ffn.
+        # optionally lat_ffn / lon_ffn from ffn_cfg). We then drop both FFNs —
+        # replaced by MoE for lat and lon.
         super().__init__(
             embed_dims=embed_dims,
             plan_config=plan_config,
             filter_mode=filter_mode,
             ffn_cfg=ffn_cfg,
         )
-        # Drop the baseline lat FFN — replaced by MoE.
         self.lat_ffn = None
+        self.lon_ffn = None
 
         aux_dim = router_aux_dim if router_aux_dim is not None else embed_dims
         self.router_aux_dim = aux_dim
         self.num_path_experts = num_path_experts
+        self.num_vel_experts = num_vel_experts
         self.tau = tau
 
         self.path_router = ETFRouter(
@@ -1137,33 +1140,64 @@ class LatLonPredModuleV13MoE(LatLonPredModuleV13):
             ffn_drop=ffn_drop,
         )
 
+        self.vel_router = ETFRouter(
+            token_dim=embed_dims,
+            aux_dim=aux_dim,
+            num_classes=num_vel_experts,
+            routing_dim=router_routing_dim,
+            hidden_dim=router_hidden_dim,
+        )
+        self.lon_moe = ExpertBankFFN(
+            embed_dims=embed_dims,
+            feedforward_channels=ffn_hidden_dim,
+            num_experts=num_vel_experts,
+            ffn_drop=ffn_drop,
+        )
+
         # Router outputs stashed per forward (for loss in head)
         self.last_path_logits = None
         self.last_path_q = None
         self.last_path_weights = None
+        self.last_vel_logits = None
+        self.last_vel_q = None
+        self.last_vel_weights = None
 
-    def _route_lat(self, path_embed, aux=None):
-        """Apply ETFRouter + ExpertBankFFN to path_embed (B, N_path, D)."""
-        B, N_path, D = path_embed.shape
-        # Sample-level token for routing
-        token = path_embed.mean(dim=1)  # (B, D)
+    def _route_moe(self, x, router, moe, aux=None):
+        """Apply ETFRouter + ExpertBankFFN to tokens (B, N, D).
+
+        Returns (out, weights, logits, q). Caller stashes router outputs.
+        """
+        B, N, D = x.shape
+        token = x.mean(dim=1)
         if aux is None:
-            # Self-conditioning fallback: aux dim must equal embed_dims
             assert self.router_aux_dim == D, (
                 f"aux=None requires router_aux_dim ({self.router_aux_dim}) == embed_dims ({D})"
             )
             aux = token
 
-        weights, logits, q = self.path_router(token, aux, tau=self.tau)
+        weights, logits, q = router(token, aux, tau=self.tau)
+        K = weights.shape[-1]
+        w_flat = weights.unsqueeze(1).expand(-1, N, -1).reshape(B * N, K)
+        x_flat = x.reshape(B * N, D)
+        out = moe(x_flat, w_flat).reshape(B, N, D)
+        return out, weights, logits, q
+
+    def _route_lat(self, path_embed, aux=None):
+        out, weights, logits, q = self._route_moe(
+            path_embed, self.path_router, self.lat_moe, aux=aux
+        )
         self.last_path_weights = weights
         self.last_path_logits = logits
         self.last_path_q = q
+        return out
 
-        # Broadcast (B, K) -> (B*N_path, K); flatten path tokens
-        K = weights.shape[-1]
-        w_flat = weights.unsqueeze(1).expand(-1, N_path, -1).reshape(B * N_path, K)
-        x_flat = path_embed.reshape(B * N_path, D)
-        out = self.lat_moe(x_flat, w_flat).reshape(B, N_path, D)
+    def _route_lon(self, vel_embed, aux=None):
+        out, weights, logits, q = self._route_moe(
+            vel_embed, self.vel_router, self.lon_moe, aux=aux
+        )
+        self.last_vel_weights = weights
+        self.last_vel_logits = logits
+        self.last_vel_q = q
         return out
 
     def forward(
@@ -1180,10 +1214,9 @@ class LatLonPredModuleV13MoE(LatLonPredModuleV13):
         num_path = path_embed.shape[1]
         num_vel = vel_embed.shape[1]
 
-        # --- MoE replaces lat_ffn ---
+        # --- MoE replaces lat_ffn / lon_ffn ---
         path_embed = self._route_lat(path_embed, aux=aux)
-        if self.lon_ffn is not None:
-            vel_embed = self.lon_ffn(vel_embed)
+        vel_embed = self._route_lon(vel_embed, aux=aux)
 
         path_scores = self.lat_cls_branch(path_embed).squeeze(-1)
         vel_scores = self.lon_cls_branch(vel_embed).squeeze(-1)

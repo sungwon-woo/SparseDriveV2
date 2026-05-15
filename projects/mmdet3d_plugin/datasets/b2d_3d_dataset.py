@@ -57,6 +57,20 @@ NUM_PATH_CLASSES = 5
 # Scenario labels that imply a lane-change maneuver context
 LANE_CHANGE_SCENARIOS = {'OVERTAKING', 'MERGING_HIGHWAY', 'MERGING_JUNCTION'}
 
+# Velocity expert class indices (lon MoE) — 6-way
+VEL_CRUISE = 0
+VEL_TRAFFIC = 1
+VEL_OVERTAKING = 2
+VEL_MERGING = 3
+VEL_EMERGENCY_BRAKE = 4
+VEL_GIVEWAY = 5
+NUM_VEL_CLASSES = 6
+
+VEL_TRAFFIC_SCENARIOS = {'TRAFFIC_LIGHT', 'TRAFFIC_SIGN'}
+VEL_OVERTAKING_SCENARIOS = {'OVERTAKING', 'PARKING_EXIT'}
+VEL_MERGING_SCENARIOS = {'MERGING_HIGHWAY', 'MERGING_JUNCTION'}
+VEL_GIVEWAY_SCENARIOS = {'GIVEWAY', 'GIVEWAY_HIGHWAY'}
+
 
 Discrete_Actions_DICT = {
     0:  (0, 0, 1, False),
@@ -474,6 +488,7 @@ class B2D3DDataset(Dataset):
         anns_results['gt_ego_fut_masks'] = ego_fut_masks
         anns_results['gt_ego_fut_cmd'] = command
         anns_results['path_class'] = np.array(self.get_path_class(info), dtype=np.int64)
+        anns_results['vel_class'] = np.array(self.get_vel_class(info), dtype=np.int64)
 
         if self.time_points is not None:
             gt_traj, gt_traj_mask = self.get_trajs(index, self.time_points)
@@ -827,6 +842,21 @@ class B2D3DDataset(Dataset):
         if cmd_far == CMD_STRAIGHT:
             return PATH_STRAIGHT
         return PATH_LANEFOLLOW
+
+    def get_vel_class(self, info):
+        """Map scenario label to 6-way velocity expert class index."""
+        scenario = self._get_scenario_label(info)
+        if scenario in VEL_TRAFFIC_SCENARIOS:
+            return VEL_TRAFFIC
+        if scenario in VEL_OVERTAKING_SCENARIOS:
+            return VEL_OVERTAKING
+        if scenario in VEL_MERGING_SCENARIOS:
+            return VEL_MERGING
+        if scenario == 'EMERGENCY_BRAKE':
+            return VEL_EMERGENCY_BRAKE
+        if scenario in VEL_GIVEWAY_SCENARIOS:
+            return VEL_GIVEWAY
+        return VEL_CRUISE
 
     def command2hot(self,command,max_dim=6):
         if command < 0:

@@ -171,6 +171,7 @@ plan_config = dict(
     traj=dict(time_points=time_points, anchor=f"data/kmeans/trajectory_{lat_fut_mode}_{lon_fut_mode}_b2d.npz", weight=50000/8/12),
     collision=dict(weight=1.0),
     path_router=dict(weight=1.0),  # DR loss weight for path MoE router (Step 6/7)
+    vel_router=dict(weight=1.0),   # DR loss weight for vel MoE router (Step 13)
 )
 cond_config = dict(
     target_point=dict(),
@@ -655,6 +656,7 @@ model = dict(
                 ),
                 # MoE hyperparams
                 num_path_experts=5,
+                num_vel_experts=6,
                 router_aux_dim=None,           # None -> self-conditioning (aux = mean(path_embed))
                 router_routing_dim=64,
                 router_hidden_dim=None,        # None -> = embed_dims
@@ -785,6 +787,7 @@ train_pipeline = [
             'gt_ego_fut_masks',
             'gt_ego_fut_cmd',
             'path_class',
+            'vel_class',
             'ego_status',
             "tp_near",
             "gt_lat",
