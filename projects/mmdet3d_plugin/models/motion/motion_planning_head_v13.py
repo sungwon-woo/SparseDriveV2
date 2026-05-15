@@ -496,6 +496,12 @@ class MotionPlanningHeadV13(BaseModule):
                 traj_point_query = None
                 plan_result["lat_cls"] = lat_cls.clone()
                 plan_result["lon_cls"] = lon_cls.clone()
+                # Capture MoE router outputs (if module is LatLonPredModuleV13MoE)
+                _moe_mod = self.layers[i]
+                if getattr(_moe_mod, "last_path_q", None) is not None:
+                    plan_result["path_router_q"] = _moe_mod.last_path_q
+                    plan_result["path_router_logits"] = _moe_mod.last_path_logits
+                    plan_result["_path_router_module"] = _moe_mod
             elif op == "traj_mode_gnn" or op == "traj_mode_norm":
                 traj_mode_query = self.layers[i](traj_mode_query)
             elif op == "traj_cond_cross_attn":
@@ -654,6 +660,14 @@ class MotionPlanningHeadV13(BaseModule):
             if point_col_cls is not None:
                 point_col_loss = self.col_plan_loss_cls(point_col_cls, point_col_label)
                 output[f"point_col_cls_loss_{decoder_idx}"] = point_col_loss * self.plan_config["point_collision"]["weight"]
+
+            # MoE router DR loss (only if LatLonPredModuleV13MoE was used)
+            if "path_router_q" in planning_result:
+                mod = planning_result["_path_router_module"]
+                path_labels = data["path_class"].to(planning_result["path_router_q"].device).long()
+                dr_loss = mod.path_router.dr_loss(planning_result["path_router_q"], path_labels)
+                dr_w = self.plan_config.get("path_router", {}).get("weight", 1.0)
+                output[f"path_router_dr_loss_{decoder_idx}"] = dr_loss * dr_w
 
         return output
 

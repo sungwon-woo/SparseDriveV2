@@ -16,6 +16,7 @@ from mmcv.cnn.bricks.registry import (
 
 from projects.mmdet3d_plugin.core.box3d import *
 from ..blocks import linear_relu_ln, AsymmetricFFN  # noqa: F401
+from .moe_utils import ETFRouter, ExpertBankFFN
 
 
 @PLUGIN_LAYERS.register_module()
@@ -1069,6 +1070,151 @@ class LatLonPredModuleV13(BaseModule):
         traj_embed = traj_embed.flatten(1, 2)
 
         return ( 
+            filter_path_embed,
+            filter_vel_embed,
+            filter_path_vocab,
+            filter_vel_vocab,
+            path_scores,
+            vel_scores,
+            traj_embed,
+            filter_traj_vocab,
+            filter_traj_mask,
+        )
+
+
+@PLUGIN_LAYERS.register_module()
+class LatLonPredModuleV13MoE(LatLonPredModuleV13):
+    """V13 with lat_ffn replaced by ETFRouter + ExpertBankFFN (Dense Soft MoE).
+
+    Router input: ``aux`` if provided, else sample-level mean of ``path_embed``.
+    Router weights ``(B, K)`` are broadcast across path candidates.
+
+    Router outputs are stashed on ``self.last_path_logits`` and
+    ``self.last_path_q`` for the head to consume in the loss (DR loss).
+    """
+
+    def __init__(
+        self,
+        embed_dims=256,
+        plan_config=None,
+        filter_mode="score",
+        ffn_cfg=None,
+        num_path_experts=5,
+        router_aux_dim=None,
+        router_routing_dim=64,
+        router_hidden_dim=None,
+        ffn_hidden_dim=512,
+        ffn_drop=0.1,
+        tau=1.0,
+    ):
+        # Initialize V13 base (this builds lat_cls_branch / lon_cls_branch and
+        # optionally lat_ffn / lon_ffn from ffn_cfg). We then drop lat_ffn.
+        super().__init__(
+            embed_dims=embed_dims,
+            plan_config=plan_config,
+            filter_mode=filter_mode,
+            ffn_cfg=ffn_cfg,
+        )
+        # Drop the baseline lat FFN — replaced by MoE.
+        self.lat_ffn = None
+
+        aux_dim = router_aux_dim if router_aux_dim is not None else embed_dims
+        self.router_aux_dim = aux_dim
+        self.num_path_experts = num_path_experts
+        self.tau = tau
+
+        self.path_router = ETFRouter(
+            token_dim=embed_dims,
+            aux_dim=aux_dim,
+            num_classes=num_path_experts,
+            routing_dim=router_routing_dim,
+            hidden_dim=router_hidden_dim,
+        )
+        self.lat_moe = ExpertBankFFN(
+            embed_dims=embed_dims,
+            feedforward_channels=ffn_hidden_dim,
+            num_experts=num_path_experts,
+            ffn_drop=ffn_drop,
+        )
+
+        # Router outputs stashed per forward (for loss in head)
+        self.last_path_logits = None
+        self.last_path_q = None
+        self.last_path_weights = None
+
+    def _route_lat(self, path_embed, aux=None):
+        """Apply ETFRouter + ExpertBankFFN to path_embed (B, N_path, D)."""
+        B, N_path, D = path_embed.shape
+        # Sample-level token for routing
+        token = path_embed.mean(dim=1)  # (B, D)
+        if aux is None:
+            # Self-conditioning fallback: aux dim must equal embed_dims
+            assert self.router_aux_dim == D, (
+                f"aux=None requires router_aux_dim ({self.router_aux_dim}) == embed_dims ({D})"
+            )
+            aux = token
+
+        weights, logits, q = self.path_router(token, aux, tau=self.tau)
+        self.last_path_weights = weights
+        self.last_path_logits = logits
+        self.last_path_q = q
+
+        # Broadcast (B, K) -> (B*N_path, K); flatten path tokens
+        K = weights.shape[-1]
+        w_flat = weights.unsqueeze(1).expand(-1, N_path, -1).reshape(B * N_path, K)
+        x_flat = path_embed.reshape(B * N_path, D)
+        out = self.lat_moe(x_flat, w_flat).reshape(B, N_path, D)
+        return out
+
+    def forward(
+        self,
+        path_embed,
+        vel_embed,
+        path_vocab,
+        vel_vocab,
+        traj_vocab,
+        traj_mask,
+        filter_num,
+        aux=None,
+    ):
+        num_path = path_embed.shape[1]
+        num_vel = vel_embed.shape[1]
+
+        # --- MoE replaces lat_ffn ---
+        path_embed = self._route_lat(path_embed, aux=aux)
+        if self.lon_ffn is not None:
+            vel_embed = self.lon_ffn(vel_embed)
+
+        path_scores = self.lat_cls_branch(path_embed).squeeze(-1)
+        vel_scores = self.lon_cls_branch(vel_embed).squeeze(-1)
+
+        filter_traj_vocab = traj_vocab.clone()
+        filter_traj_mask = traj_mask.clone()
+
+        if num_path > filter_num[0]:
+            topk_path_scores, topk_path_indices = torch.topk(path_scores, filter_num[0], dim=1)
+            filter_path_embed = torch.gather(path_embed, 1, topk_path_indices.unsqueeze(-1).expand(-1, -1, path_embed.shape[-1]))
+            filter_path_vocab = torch.gather(path_vocab, 1, topk_path_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, path_vocab.shape[-2], path_vocab.shape[-1]))
+            filter_traj_vocab = torch.gather(filter_traj_vocab, 1, topk_path_indices[:, :, None, None, None].expand(-1, -1, filter_traj_vocab.shape[-3], filter_traj_vocab.shape[-2], filter_traj_vocab.shape[-1]))
+            filter_traj_mask = torch.gather(filter_traj_mask, 1, topk_path_indices[:, :, None, None].expand(-1, -1, filter_traj_mask.shape[-2], filter_traj_mask.shape[-1]))
+        else:
+            filter_path_embed = path_embed
+            filter_path_vocab = path_vocab
+
+        if num_vel > filter_num[1]:
+            topk_vel_scores, topk_vel_indices = torch.topk(vel_scores, filter_num[1], dim=1)
+            filter_vel_embed = torch.gather(vel_embed, 1, topk_vel_indices.unsqueeze(-1).expand(-1, -1, vel_embed.shape[-1]))
+            filter_vel_vocab = torch.gather(vel_vocab, 1, topk_vel_indices.unsqueeze(-1).expand(-1, -1, vel_vocab.shape[-1]))
+            filter_traj_vocab = torch.gather(filter_traj_vocab, 2, topk_vel_indices[:, None, :, None, None].expand(-1, filter_traj_vocab.shape[-4], -1, filter_traj_vocab.shape[-2], filter_traj_vocab.shape[-1]))
+            filter_traj_mask = torch.gather(filter_traj_mask, 2, topk_vel_indices[:, None, :, None].expand(-1, filter_traj_mask.shape[-3], -1, filter_traj_mask.shape[-1]))
+        else:
+            filter_vel_embed = vel_embed
+            filter_vel_vocab = vel_vocab
+
+        traj_embed = filter_path_embed.unsqueeze(2) + filter_vel_embed.unsqueeze(1)
+        traj_embed = traj_embed.flatten(1, 2)
+
+        return (
             filter_path_embed,
             filter_vel_embed,
             filter_path_vocab,

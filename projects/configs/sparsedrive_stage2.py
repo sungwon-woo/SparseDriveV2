@@ -22,6 +22,7 @@ log_config = dict(
     interval=51 if "train" in version else 1,
     hooks=[
         dict(type="TextLoggerHook", by_epoch=False),
+        
         dict(type="TensorboardLoggerHook"),
     ],
 )
@@ -169,6 +170,7 @@ plan_config = dict(
     lon=dict(time_points=time_points, anchor="data/kmeans/vel_seq_K256_t30.npy", weight=100/2),
     traj=dict(time_points=time_points, anchor=f"data/kmeans/trajectory_{lat_fut_mode}_{lon_fut_mode}_b2d.npz", weight=50000/8/12),
     collision=dict(weight=1.0),
+    path_router=dict(weight=1.0),  # DR loss weight for path MoE router (Step 6/7)
 )
 cond_config = dict(
     target_point=dict(),
@@ -637,9 +639,10 @@ model = dict(
                 fut_mode=fut_mode,
             ),
             lat_lon_pred_layer=dict(
-                type="LatLonPredModuleV13",
+                type="LatLonPredModuleV13MoE",
                 embed_dims=embed_dims,
                 plan_config=plan_config,
+                # lon (vel) still uses a single AsymmetricFFN; lat is replaced by MoE
                 ffn_cfg=dict(
                     type="AsymmetricFFN",
                     in_channels=embed_dims,
@@ -650,6 +653,14 @@ model = dict(
                     ffn_drop=0.1,
                     add_identity=True,
                 ),
+                # MoE hyperparams
+                num_path_experts=5,
+                router_aux_dim=None,           # None -> self-conditioning (aux = mean(path_embed))
+                router_routing_dim=64,
+                router_hidden_dim=None,        # None -> = embed_dims
+                ffn_hidden_dim=embed_dims * 2, # match AsymmetricFFN feedforward width
+                ffn_drop=0.1,
+                tau=1.0,
             ),
             traj_pred_layer=dict(
                 type="TrajPredModule",
@@ -773,6 +784,7 @@ train_pipeline = [
             'gt_ego_fut_trajs',
             'gt_ego_fut_masks',
             'gt_ego_fut_cmd',
+            'path_class',
             'ego_status',
             "tp_near",
             "gt_lat",
@@ -858,6 +870,7 @@ data_basic_config = dict(
     plan_config=plan_config,
     path_mode="ego",
     vel_mode="vel",
+    scenario_label_root="data/DriveMoE/labels/scenario_labels",
 )
 eval_config = dict(
     **data_basic_config,
@@ -930,6 +943,18 @@ runner = dict(
     type="IterBasedRunner",
     max_iters=num_iters_per_epoch * num_epochs,
 )
+
+# Tau annealing for MoE router softmax (Step 8)
+custom_hooks = [
+    dict(
+        type="TauAnnealingHook",
+        tau_start=1.0,
+        tau_end=0.3,
+        anneal_iters=num_iters_per_epoch * max(num_epochs // 2, 1),
+        update_interval=200,
+        priority="NORMAL",
+    ),
+]
 
 # ================== eval ========================
 eval_mode = dict(

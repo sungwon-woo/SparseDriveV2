@@ -38,6 +38,26 @@ from .utils import (
     draw_lidar_bbox3d_on_bev,
 )
 
+# CARLA navigation command encoding (info['command_far'/'command_near'])
+CMD_LEFT = 1
+CMD_RIGHT = 2
+CMD_STRAIGHT = 3
+CMD_LANEFOLLOW = 4
+CMD_CHANGELANELEFT = 5
+CMD_CHANGELANERIGHT = 6
+
+# Path expert class indices (lat MoE)
+PATH_LANEFOLLOW = 0
+PATH_LANE_CHANGE = 1
+PATH_LEFT = 2
+PATH_RIGHT = 3
+PATH_STRAIGHT = 4
+NUM_PATH_CLASSES = 5
+
+# Scenario labels that imply a lane-change maneuver context
+LANE_CHANGE_SCENARIOS = {'OVERTAKING', 'MERGING_HIGHWAY', 'MERGING_JUNCTION'}
+
+
 Discrete_Actions_DICT = {
     0:  (0, 0, 1, False),
     1:  (0.7, -0.5, 0, False),
@@ -139,6 +159,7 @@ class B2D3DDataset(Dataset):
         path_mode="lidar",
         vel_mode="ego",
         time_points=None,
+        scenario_label_root=None,
     ):
         self.load_interval = load_interval
         super().__init__()
@@ -154,6 +175,8 @@ class B2D3DDataset(Dataset):
         self.path_mode = path_mode
         self.vel_mode = vel_mode
         self.time_points = time_points
+        self.scenario_label_root = scenario_label_root
+        self._scenario_cache = {}
 
         if classes is not None:
             self.CLASSES = classes
@@ -450,6 +473,7 @@ class B2D3DDataset(Dataset):
         anns_results['gt_ego_fut_trajs'] = ego_fut_trajs
         anns_results['gt_ego_fut_masks'] = ego_fut_masks
         anns_results['gt_ego_fut_cmd'] = command
+        anns_results['path_class'] = np.array(self.get_path_class(info), dtype=np.int64)
 
         if self.time_points is not None:
             gt_traj, gt_traj_mask = self.get_trajs(index, self.time_points)
@@ -771,6 +795,39 @@ class B2D3DDataset(Dataset):
         offset_track = offset_track.astype(np.float32)
         return offset_track[:past_frames].copy(), offset_track[past_frames:].copy(), full_adj_adj_mask[-future_frames:].copy(), command
     
+    def _get_scenario_label(self, info):
+        """Return scenario label string for a frame, or None if unavailable."""
+        if self.scenario_label_root is None:
+            return None
+        folder = info['folder']
+        basename = folder.split('/')[-1]
+        cache = self._scenario_cache
+        if basename not in cache:
+            path = osp.join(self.scenario_label_root, basename + '.json')
+            if not osp.isfile(path):
+                cache[basename] = None
+            else:
+                with open(path, 'r') as f:
+                    cache[basename] = json.load(f)
+        labels = cache[basename]
+        if labels is None:
+            return None
+        return labels.get(str(info['frame_idx']))
+
+    def get_path_class(self, info):
+        """Combine command_far + scenario label into 5-way path class index."""
+        cmd_far = info.get('command_far', CMD_LANEFOLLOW)
+        scenario = self._get_scenario_label(info)
+        if scenario in LANE_CHANGE_SCENARIOS or cmd_far in (CMD_CHANGELANELEFT, CMD_CHANGELANERIGHT):
+            return PATH_LANE_CHANGE
+        if cmd_far == CMD_LEFT:
+            return PATH_LEFT
+        if cmd_far == CMD_RIGHT:
+            return PATH_RIGHT
+        if cmd_far == CMD_STRAIGHT:
+            return PATH_STRAIGHT
+        return PATH_LANEFOLLOW
+
     def command2hot(self,command,max_dim=6):
         if command < 0:
             command = 4
